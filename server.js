@@ -26,6 +26,12 @@ app.post("/api/room", (req, res) => {
     id: roomId,
     participants: {},
     messages: [], // Store chat messages
+    hostId: null, // Track room host
+    chatSettings: {
+      allowParticipantChat: true,
+      allowPrivateMessages: true,
+      moderateMessages: false,
+    },
     createdAt: new Date(),
   };
   console.log(`Created room: ${roomId}`);
@@ -47,8 +53,11 @@ app.get("/api/room/:roomId", (req, res) => {
     participants: Object.values(room.participants).map((p) => ({
       username: p.username,
       joinedAt: p.joinedAt,
+      isHost: p.id === room.hostId,
     })),
     messageCount: room.messages.length,
+    hostId: room.hostId,
+    chatSettings: room.chatSettings,
   });
 });
 
@@ -74,6 +83,14 @@ io.on("connection", (socket) => {
 
     // Store participant info
     const participantId = socket.id;
+    const isFirstParticipant =
+      Object.keys(rooms[roomId].participants).length === 0;
+
+    // Set host if first participant
+    if (isFirstParticipant) {
+      rooms[roomId].hostId = participantId;
+    }
+
     rooms[roomId].participants[participantId] = {
       id: participantId,
       username,
@@ -82,19 +99,41 @@ io.on("connection", (socket) => {
       joinedAt: new Date(),
       audioEnabled: true,
       videoEnabled: true,
+      isHost: isFirstParticipant,
     };
 
     console.log(
       `${username} joined room ${roomId}. Total participants: ${
         Object.keys(rooms[roomId].participants).length
-      }`
+      }. Host: ${isFirstParticipant ? "YES" : "NO"}`
     );
+
+    // Send room info and host status
+    socket.emit("room-info", {
+      roomCreatedAt: rooms[roomId].createdAt,
+      isFirstParticipant,
+      hostId: rooms[roomId].hostId,
+    });
 
     // Send recent chat messages to the new user
     const recentMessages = rooms[roomId].messages.slice(-50); // Send last 50 messages
     recentMessages.forEach((message) => {
-      socket.emit("chat-message", message);
+      // Filter messages based on user permissions
+      if (shouldReceiveMessage(message, participantId, rooms[roomId])) {
+        if (message.chatMode === "private") {
+          socket.emit("private-message", message);
+        } else if (message.chatMode === "host-only") {
+          if (isFirstParticipant) {
+            socket.emit("host-message", message);
+          }
+        } else {
+          socket.emit("chat-message", message);
+        }
+      }
     });
+
+    // Send chat settings to the new user
+    socket.emit("chat-settings-updated", rooms[roomId].chatSettings);
 
     // Notify existing participants about the new user
     socket.to(roomId).emit("user-joined", {
@@ -122,12 +161,175 @@ io.on("connection", (socket) => {
     );
   });
 
-  // Handle chat messages
-  socket.on("send-chat-message", ({ roomId, username, message, timestamp }) => {
-    console.log(`Chat message from ${username} in room ${roomId}: ${message}`);
+  // Helper function to determine if user should receive a message
+  function shouldReceiveMessage(message, participantId, room) {
+    // System messages are visible to all
+    if (message.type === "system") return true;
+
+    const participant = room.participants[participantId];
+    const isHost = participant && participant.id === room.hostId;
+
+    // Public messages
+    if (message.chatMode === "public") {
+      return room.chatSettings.allowParticipantChat || isHost;
+    }
+
+    // Private messages
+    if (message.chatMode === "private") {
+      return (
+        message.senderId === participantId || // Sender
+        message.recipientId === participantId || // Direct recipient
+        (message.toHost && isHost) || // Message to host
+        isHost // Host can see all private messages
+      );
+    }
+
+    // Host-only messages
+    if (message.chatMode === "host-only") {
+      return isHost;
+    }
+
+    return false;
+  }
+
+  // Handle public chat messages
+  socket.on(
+    "send-chat-message",
+    ({ roomId, username, message, timestamp, chatMode }) => {
+      console.log(
+        `Public chat message from ${username} in room ${roomId}: ${message}`
+      );
+
+      if (!rooms[roomId]) {
+        console.log(`Room ${roomId} does not exist for chat message`);
+        return;
+      }
+
+      const participant = rooms[roomId].participants[socket.id];
+      const isHost = participant && participant.id === rooms[roomId].hostId;
+
+      // Check permissions
+      if (!isHost && !rooms[roomId].chatSettings.allowParticipantChat) {
+        socket.emit("chat-error", { message: "Public chat is disabled" });
+        return;
+      }
+
+      const messageData = {
+        id: uuidv4(),
+        username,
+        message,
+        timestamp: timestamp || new Date(),
+        type: "user",
+        chatMode: "public",
+        senderId: socket.id,
+      };
+
+      // Store message in room
+      rooms[roomId].messages.push(messageData);
+
+      // Keep only last 100 messages to prevent memory issues
+      if (rooms[roomId].messages.length > 100) {
+        rooms[roomId].messages = rooms[roomId].messages.slice(-100);
+      }
+
+      // Broadcast message to all participants in the room
+      io.to(roomId).emit("chat-message", messageData);
+    }
+  );
+
+  // Handle private messages
+  socket.on(
+    "send-private-message",
+    ({ roomId, username, message, timestamp, recipient, toHost }) => {
+      console.log(
+        `Private message from ${username} in room ${roomId} to ${
+          recipient || "host"
+        }: ${message}`
+      );
+
+      if (!rooms[roomId]) {
+        return;
+      }
+
+      const participant = rooms[roomId].participants[socket.id];
+      const isHost = participant && participant.id === rooms[roomId].hostId;
+
+      // Check permissions
+      if (!isHost && !rooms[roomId].chatSettings.allowPrivateMessages) {
+        socket.emit("chat-error", { message: "Private messages are disabled" });
+        return;
+      }
+
+      let recipientId = null;
+
+      // Find recipient
+      if (toHost) {
+        recipientId = rooms[roomId].hostId;
+      } else if (recipient) {
+        // Find participant by username
+        const recipientParticipant = Object.values(
+          rooms[roomId].participants
+        ).find((p) => p.username === recipient);
+        recipientId = recipientParticipant ? recipientParticipant.id : null;
+      }
+
+      if (!recipientId) {
+        socket.emit("chat-error", { message: "Recipient not found" });
+        return;
+      }
+
+      const messageData = {
+        id: uuidv4(),
+        username,
+        message,
+        timestamp: timestamp || new Date(),
+        type: "user",
+        chatMode: "private",
+        senderId: socket.id,
+        recipientId,
+        recipient,
+        toHost,
+      };
+
+      // Store message in room
+      rooms[roomId].messages.push(messageData);
+
+      // Keep only last 100 messages
+      if (rooms[roomId].messages.length > 100) {
+        rooms[roomId].messages = rooms[roomId].messages.slice(-100);
+      }
+
+      // Send to sender
+      socket.emit("private-message", messageData);
+
+      // Send to recipient
+      if (recipientId !== socket.id) {
+        io.to(recipientId).emit("private-message", messageData);
+      }
+
+      // If message is to host and sender is not host, also send to host
+      if (toHost && !isHost) {
+        io.to(rooms[roomId].hostId).emit("private-message", messageData);
+      }
+    }
+  );
+
+  // Handle host-only messages
+  socket.on("send-host-message", ({ roomId, username, message, timestamp }) => {
+    console.log(`Host message from ${username} in room ${roomId}: ${message}`);
 
     if (!rooms[roomId]) {
-      console.log(`Room ${roomId} does not exist for chat message`);
+      return;
+    }
+
+    const participant = rooms[roomId].participants[socket.id];
+    const isHost = participant && participant.id === rooms[roomId].hostId;
+
+    // Only host can send host-only messages
+    if (!isHost) {
+      socket.emit("chat-error", {
+        message: "Only host can send announcements",
+      });
       return;
     }
 
@@ -137,18 +339,20 @@ io.on("connection", (socket) => {
       message,
       timestamp: timestamp || new Date(),
       type: "user",
+      chatMode: "host-only",
+      senderId: socket.id,
     };
 
     // Store message in room
     rooms[roomId].messages.push(messageData);
 
-    // Keep only last 100 messages to prevent memory issues
+    // Keep only last 100 messages
     if (rooms[roomId].messages.length > 100) {
       rooms[roomId].messages = rooms[roomId].messages.slice(-100);
     }
 
-    // Broadcast message to all participants in the room
-    io.to(roomId).emit("chat-message", messageData);
+    // Send only to host (for now, could be extended to all participants)
+    socket.emit("host-message", messageData);
   });
 
   // Handle system messages (user joined/left)
@@ -177,6 +381,35 @@ io.on("connection", (socket) => {
 
     // Broadcast system message to all participants
     io.to(roomId).emit("chat-system-message", messageData);
+  });
+
+  // Handle chat settings updates (host only)
+  socket.on("update-chat-settings", ({ roomId, settings }) => {
+    if (!rooms[roomId]) {
+      return;
+    }
+
+    const participant = rooms[roomId].participants[socket.id];
+    const isHost = participant && participant.id === rooms[roomId].hostId;
+
+    // Only host can update chat settings
+    if (!isHost) {
+      socket.emit("chat-error", {
+        message: "Only host can update chat settings",
+      });
+      return;
+    }
+
+    // Update room chat settings
+    rooms[roomId].chatSettings = { ...rooms[roomId].chatSettings, ...settings };
+
+    console.log(
+      `Chat settings updated in room ${roomId}:`,
+      rooms[roomId].chatSettings
+    );
+
+    // Broadcast updated settings to all participants
+    io.to(roomId).emit("chat-settings-updated", rooms[roomId].chatSettings);
   });
 
   // Handle typing indicators
@@ -228,7 +461,22 @@ io.on("connection", (socket) => {
   socket.on("remove-participant", ({ roomId, participantId, peerId }) => {
     console.log(`Removing participant: ${participantId}`);
 
-    if (rooms[roomId] && rooms[roomId].participants[participantId]) {
+    if (!rooms[roomId]) {
+      return;
+    }
+
+    const requester = rooms[roomId].participants[socket.id];
+    const isHost = requester && requester.id === rooms[roomId].hostId;
+
+    // Only host can remove participants
+    if (!isHost) {
+      socket.emit("chat-error", {
+        message: "Only host can remove participants",
+      });
+      return;
+    }
+
+    if (rooms[roomId].participants[participantId]) {
       const removedParticipant = rooms[roomId].participants[participantId];
 
       // Send system message about user removal
@@ -260,6 +508,58 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Handle transferring host privileges
+  socket.on("transfer-host", ({ roomId, newHostId }) => {
+    if (!rooms[roomId]) {
+      return;
+    }
+
+    const currentHost = rooms[roomId].participants[socket.id];
+    const isCurrentHost =
+      currentHost && currentHost.id === rooms[roomId].hostId;
+
+    // Only current host can transfer privileges
+    if (!isCurrentHost) {
+      socket.emit("chat-error", {
+        message: "Only host can transfer privileges",
+      });
+      return;
+    }
+
+    const newHost = rooms[roomId].participants[newHostId];
+    if (!newHost) {
+      socket.emit("chat-error", { message: "New host not found" });
+      return;
+    }
+
+    // Update host status
+    rooms[roomId].hostId = newHostId;
+    rooms[roomId].participants[socket.id].isHost = false;
+    rooms[roomId].participants[newHostId].isHost = true;
+
+    // Send system message
+    const systemMessage = {
+      id: uuidv4(),
+      message: `${newHost.username} is now the host`,
+      timestamp: new Date(),
+      type: "system",
+      systemType: "host-change",
+    };
+
+    rooms[roomId].messages.push(systemMessage);
+    io.to(roomId).emit("chat-system-message", systemMessage);
+
+    // Notify all participants of host change
+    io.to(roomId).emit("host-privileges-updated", {
+      newHostId,
+      newHostUsername: newHost.username,
+    });
+
+    console.log(
+      `Host transferred from ${currentHost.username} to ${newHost.username} in room ${roomId}`
+    );
+  });
+
   // Handle disconnection
   socket.on("disconnect", () => {
     console.log(`User disconnected: ${socket.id}`);
@@ -268,8 +568,13 @@ io.on("connection", (socket) => {
     for (const roomId in rooms) {
       if (rooms[roomId].participants[socket.id]) {
         const participant = rooms[roomId].participants[socket.id];
+        const wasHost = participant.id === rooms[roomId].hostId;
 
-        console.log(`${participant.username} left room ${roomId}`);
+        console.log(
+          `${participant.username} left room ${roomId}${
+            wasHost ? " (was host)" : ""
+          }`
+        );
 
         // Send system message about user leaving
         const systemMessage = {
@@ -292,6 +597,36 @@ io.on("connection", (socket) => {
 
         // Remove from room data
         delete rooms[roomId].participants[socket.id];
+
+        // If host left, transfer to next participant
+        if (wasHost) {
+          const remainingParticipants = Object.values(
+            rooms[roomId].participants
+          );
+          if (remainingParticipants.length > 0) {
+            const newHost = remainingParticipants[0];
+            rooms[roomId].hostId = newHost.id;
+            newHost.isHost = true;
+
+            // Notify new host
+            const hostMessage = {
+              id: uuidv4(),
+              message: `${newHost.username} is now the host`,
+              timestamp: new Date(),
+              type: "system",
+              systemType: "host-change",
+            };
+
+            rooms[roomId].messages.push(hostMessage);
+            io.to(roomId).emit("chat-system-message", hostMessage);
+            io.to(roomId).emit("host-privileges-updated", {
+              newHostId: newHost.id,
+              newHostUsername: newHost.username,
+            });
+
+            console.log(`Host privileges transferred to ${newHost.username}`);
+          }
+        }
 
         console.log(
           `Room ${roomId} now has ${
@@ -330,15 +665,19 @@ app.get("/api/debug/rooms", (req, res) => {
     roomSummary[roomId] = {
       participantCount: Object.keys(rooms[roomId].participants).length,
       messageCount: rooms[roomId].messages.length,
+      hostId: rooms[roomId].hostId,
+      chatSettings: rooms[roomId].chatSettings,
       participants: Object.values(rooms[roomId].participants).map((p) => ({
         username: p.username,
         peerId: p.peerId,
         joinedAt: p.joinedAt,
+        isHost: p.id === rooms[roomId].hostId,
       })),
       recentMessages: rooms[roomId].messages.slice(-5).map((m) => ({
         username: m.username,
         message: m.message,
         type: m.type,
+        chatMode: m.chatMode,
         timestamp: m.timestamp,
       })),
     };
@@ -358,6 +697,22 @@ app.get("/api/room/:roomId/messages", (req, res) => {
   res.json({
     roomId: room.id,
     messages: room.messages,
+    chatSettings: room.chatSettings,
+  });
+});
+
+// Get chat settings for a room
+app.get("/api/room/:roomId/chat-settings", (req, res) => {
+  const { roomId } = req.params;
+  const room = rooms[roomId];
+
+  if (!room) {
+    return res.status(404).json({ error: "Room not found" });
+  }
+
+  res.json({
+    roomId: room.id,
+    chatSettings: room.chatSettings,
   });
 });
 
