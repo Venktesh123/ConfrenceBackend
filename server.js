@@ -25,6 +25,7 @@ app.post("/api/room", (req, res) => {
   rooms[roomId] = {
     id: roomId,
     participants: {},
+    messages: [], // Store chat messages
     createdAt: new Date(),
   };
   console.log(`Created room: ${roomId}`);
@@ -47,6 +48,7 @@ app.get("/api/room/:roomId", (req, res) => {
       username: p.username,
       joinedAt: p.joinedAt,
     })),
+    messageCount: room.messages.length,
   });
 });
 
@@ -88,6 +90,12 @@ io.on("connection", (socket) => {
       }`
     );
 
+    // Send recent chat messages to the new user
+    const recentMessages = rooms[roomId].messages.slice(-50); // Send last 50 messages
+    recentMessages.forEach((message) => {
+      socket.emit("chat-message", message);
+    });
+
     // Notify existing participants about the new user
     socket.to(roomId).emit("user-joined", {
       participantId,
@@ -112,6 +120,76 @@ io.on("connection", (socket) => {
         Object.keys(existingParticipants).length
       } existing participants to ${username}`
     );
+  });
+
+  // Handle chat messages
+  socket.on("send-chat-message", ({ roomId, username, message, timestamp }) => {
+    console.log(`Chat message from ${username} in room ${roomId}: ${message}`);
+
+    if (!rooms[roomId]) {
+      console.log(`Room ${roomId} does not exist for chat message`);
+      return;
+    }
+
+    const messageData = {
+      id: uuidv4(),
+      username,
+      message,
+      timestamp: timestamp || new Date(),
+      type: "user",
+    };
+
+    // Store message in room
+    rooms[roomId].messages.push(messageData);
+
+    // Keep only last 100 messages to prevent memory issues
+    if (rooms[roomId].messages.length > 100) {
+      rooms[roomId].messages = rooms[roomId].messages.slice(-100);
+    }
+
+    // Broadcast message to all participants in the room
+    io.to(roomId).emit("chat-message", messageData);
+  });
+
+  // Handle system messages (user joined/left)
+  socket.on("send-system-message", ({ roomId, message, type }) => {
+    console.log(`System message in room ${roomId}: ${message}`);
+
+    if (!rooms[roomId]) {
+      return;
+    }
+
+    const messageData = {
+      id: uuidv4(),
+      message,
+      timestamp: new Date(),
+      type: "system",
+      systemType: type, // 'join' or 'leave'
+    };
+
+    // Store system message in room
+    rooms[roomId].messages.push(messageData);
+
+    // Keep only last 100 messages
+    if (rooms[roomId].messages.length > 100) {
+      rooms[roomId].messages = rooms[roomId].messages.slice(-100);
+    }
+
+    // Broadcast system message to all participants
+    io.to(roomId).emit("chat-system-message", messageData);
+  });
+
+  // Handle typing indicators
+  socket.on("typing-indicator", ({ roomId, username, isTyping }) => {
+    if (!rooms[roomId]) {
+      return;
+    }
+
+    // Broadcast typing indicator to other participants
+    socket.to(roomId).emit("user-typing", {
+      username,
+      isTyping,
+    });
   });
 
   // Handle user muting/unmuting audio
@@ -151,6 +229,20 @@ io.on("connection", (socket) => {
     console.log(`Removing participant: ${participantId}`);
 
     if (rooms[roomId] && rooms[roomId].participants[participantId]) {
+      const removedParticipant = rooms[roomId].participants[participantId];
+
+      // Send system message about user removal
+      const systemMessage = {
+        id: uuidv4(),
+        message: `${removedParticipant.username} was removed from the meeting`,
+        timestamp: new Date(),
+        type: "system",
+        systemType: "remove",
+      };
+
+      rooms[roomId].messages.push(systemMessage);
+      io.to(roomId).emit("chat-system-message", systemMessage);
+
       // Notify the participant they're being removed
       io.to(participantId).emit("you-were-removed");
 
@@ -179,10 +271,23 @@ io.on("connection", (socket) => {
 
         console.log(`${participant.username} left room ${roomId}`);
 
+        // Send system message about user leaving
+        const systemMessage = {
+          id: uuidv4(),
+          message: `${participant.username} left the meeting`,
+          timestamp: new Date(),
+          type: "system",
+          systemType: "leave",
+        };
+
+        rooms[roomId].messages.push(systemMessage);
+        socket.to(roomId).emit("chat-system-message", systemMessage);
+
         // Notify other participants
         socket.to(roomId).emit("user-left", {
           participantId: socket.id,
           peerId: participant.peerId,
+          username: participant.username,
         });
 
         // Remove from room data
@@ -224,14 +329,36 @@ app.get("/api/debug/rooms", (req, res) => {
   Object.keys(rooms).forEach((roomId) => {
     roomSummary[roomId] = {
       participantCount: Object.keys(rooms[roomId].participants).length,
+      messageCount: rooms[roomId].messages.length,
       participants: Object.values(rooms[roomId].participants).map((p) => ({
         username: p.username,
         peerId: p.peerId,
         joinedAt: p.joinedAt,
       })),
+      recentMessages: rooms[roomId].messages.slice(-5).map((m) => ({
+        username: m.username,
+        message: m.message,
+        type: m.type,
+        timestamp: m.timestamp,
+      })),
     };
   });
   res.json(roomSummary);
+});
+
+// Get chat history for a room
+app.get("/api/room/:roomId/messages", (req, res) => {
+  const { roomId } = req.params;
+  const room = rooms[roomId];
+
+  if (!room) {
+    return res.status(404).json({ error: "Room not found" });
+  }
+
+  res.json({
+    roomId: room.id,
+    messages: room.messages,
+  });
 });
 
 const PORT = process.env.PORT || 5000;
