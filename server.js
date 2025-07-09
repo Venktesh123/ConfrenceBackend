@@ -56,6 +56,7 @@ app.get("/api/room/:roomId", (req, res) => {
       username: p.username,
       joinedAt: p.joinedAt,
       isHost: p.id === room.hostId,
+      isScreenSharing: p.isScreenSharing || false,
     })),
     messageCount: room.messages.length,
     hostId: room.hostId,
@@ -102,6 +103,7 @@ io.on("connection", (socket) => {
       audioEnabled: true,
       videoEnabled: true,
       isHost: isFirstParticipant,
+      isScreenSharing: false, // Add screen sharing state
     };
 
     console.log(
@@ -459,6 +461,28 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Handle screen sharing events
+  socket.on("user-screen-share", ({ roomId, peerId, isSharing }) => {
+    console.log(`Screen share toggle: ${socket.id} - ${isSharing}`);
+
+    if (rooms[roomId] && rooms[roomId].participants[socket.id]) {
+      rooms[roomId].participants[socket.id].isScreenSharing = isSharing;
+
+      // Notify other participants about screen sharing status
+      socket.to(roomId).emit("user-screen-share", {
+        participantId: socket.id,
+        peerId,
+        isSharing,
+      });
+
+      console.log(
+        `User ${rooms[roomId].participants[socket.id].username} ${
+          isSharing ? "started" : "stopped"
+        } screen sharing in room ${roomId}`
+      );
+    }
+  });
+
   // Handle removing a participant (by admin)
   socket.on("remove-participant", ({ roomId, participantId, peerId }) => {
     console.log(`Removing participant: ${participantId}`);
@@ -674,6 +698,7 @@ app.get("/api/debug/rooms", (req, res) => {
         peerId: p.peerId,
         joinedAt: p.joinedAt,
         isHost: p.id === rooms[roomId].hostId,
+        isScreenSharing: p.isScreenSharing || false,
       })),
       recentMessages: rooms[roomId].messages.slice(-5).map((m) => ({
         username: m.username,
