@@ -37,7 +37,9 @@ app.post("/api/room", (req, res) => {
   console.log(`Created room: ${roomId}`);
   res.json({ roomId });
 });
-
+app.get("/", (req, res) => {
+  return res.send("Welcome to the Meeting Room API");
+});
 // Get room info
 app.get("/api/room/:roomId", (req, res) => {
   const { roomId } = req.params;
