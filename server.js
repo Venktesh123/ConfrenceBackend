@@ -37,9 +37,11 @@ app.post("/api/room", (req, res) => {
   console.log(`Created room: ${roomId}`);
   res.json({ roomId });
 });
+
 app.get("/", (req, res) => {
   return res.send("Welcome to the Meeting Room API");
 });
+
 // Get room info
 app.get("/api/room/:roomId", (req, res) => {
   const { roomId } = req.params;
@@ -112,6 +114,9 @@ io.on("connection", (socket) => {
       }. Host: ${isFirstParticipant ? "YES" : "NO"}`
     );
 
+    // Send host status to the joining user
+    socket.emit("host-assigned", { isHost: isFirstParticipant });
+
     // Send room info and host status
     socket.emit("room-info", {
       roomCreatedAt: rooms[roomId].createdAt,
@@ -139,11 +144,12 @@ io.on("connection", (socket) => {
     // Send chat settings to the new user
     socket.emit("chat-settings-updated", rooms[roomId].chatSettings);
 
-    // Notify existing participants about the new user
+    // Notify existing participants about the new user (include host status)
     socket.to(roomId).emit("user-joined", {
       participantId,
       username,
       peerId,
+      isHost: isFirstParticipant,
     });
 
     // Send current participants to the new user
@@ -195,6 +201,144 @@ io.on("connection", (socket) => {
 
     return false;
   }
+
+  // NEW: Host control for audio
+  socket.on(
+    "host-control-audio",
+    ({ roomId, targetPeerId, action, forced }) => {
+      const room = rooms[roomId];
+      if (!room) return;
+
+      const hostParticipant = room.participants[socket.id];
+
+      // Verify sender is host
+      if (!hostParticipant || !hostParticipant.isHost) {
+        socket.emit("chat-error", {
+          message: "Only hosts can control other participants",
+        });
+        return;
+      }
+
+      // Find target participant by peerId
+      let targetSocketId = null;
+      for (const [socketId, participant] of Object.entries(room.participants)) {
+        if (participant.peerId === targetPeerId) {
+          targetSocketId = socketId;
+          break;
+        }
+      }
+
+      if (!targetSocketId) {
+        socket.emit("chat-error", { message: "Participant not found" });
+        return;
+      }
+
+      // Update participant state
+      if (action === "mute") {
+        room.participants[targetSocketId].audioEnabled = false;
+
+        // Send force mute to target participant
+        io.to(targetSocketId).emit("host-muted-audio", { forced });
+
+        // Notify all participants about the change
+        io.to(roomId).emit("user-toggle-audio", {
+          participantId: targetSocketId,
+          peerId: targetPeerId,
+          enabled: false,
+        });
+
+        // Send system message to chat
+        io.to(roomId).emit("chat-system-message", {
+          id: uuidv4(),
+          message: `${room.participants[targetSocketId].username} was muted by host`,
+          timestamp: new Date(),
+          type: "system",
+          systemType: "host-action",
+        });
+      } else if (action === "unmute") {
+        // For unmute, just request - don't force
+        io.to(targetSocketId).emit("host-unmuted-audio");
+
+        // Send system message to chat
+        io.to(roomId).emit("chat-system-message", {
+          id: uuidv4(),
+          message: `Host requested ${room.participants[targetSocketId].username} to unmute`,
+          timestamp: new Date(),
+          type: "system",
+          systemType: "host-request",
+        });
+      }
+    }
+  );
+
+  // NEW: Host control for video
+  socket.on(
+    "host-control-video",
+    ({ roomId, targetPeerId, action, forced }) => {
+      const room = rooms[roomId];
+      if (!room) return;
+
+      const hostParticipant = room.participants[socket.id];
+
+      // Verify sender is host
+      if (!hostParticipant || !hostParticipant.isHost) {
+        socket.emit("chat-error", {
+          message: "Only hosts can control other participants",
+        });
+        return;
+      }
+
+      // Find target participant by peerId
+      let targetSocketId = null;
+      for (const [socketId, participant] of Object.entries(room.participants)) {
+        if (participant.peerId === targetPeerId) {
+          targetSocketId = socketId;
+          break;
+        }
+      }
+
+      if (!targetSocketId) {
+        socket.emit("chat-error", { message: "Participant not found" });
+        return;
+      }
+
+      // Update participant state
+      if (action === "disable") {
+        room.participants[targetSocketId].videoEnabled = false;
+
+        // Send force disable to target participant
+        io.to(targetSocketId).emit("host-disabled-video", { forced });
+
+        // Notify all participants about the change
+        io.to(roomId).emit("user-toggle-video", {
+          participantId: targetSocketId,
+          peerId: targetPeerId,
+          enabled: false,
+        });
+
+        // Send system message to chat
+        io.to(roomId).emit("chat-system-message", {
+          id: uuidv4(),
+          message: `${room.participants[targetSocketId].username}'s camera was turned off by host`,
+          timestamp: new Date(),
+          type: "system",
+          systemType: "host-action",
+        });
+      } else if (action === "enable") {
+        // For enable, just request - don't force
+        io.to(targetSocketId).emit("host-enabled-video");
+
+        // Send system message to chat
+        io.to(roomId).emit("chat-system-message", {
+          id: uuidv4(),
+          message: `Host requested ${room.participants[targetSocketId].username} to turn on camera`,
+          timestamp: new Date(),
+          type: "system",
+          systemType: "host-request",
+        });
+      }
+    }
+  );
 
   // Handle public chat messages
   socket.on(
@@ -429,7 +573,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  // Handle user muting/unmuting audio
+  // Handle user muting/unmuting audio (Updated to include participantId)
   socket.on("toggle-audio", ({ roomId, peerId, enabled }) => {
     console.log(`Audio toggle: ${socket.id} - ${enabled}`);
 
@@ -445,7 +589,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Handle user muting/unmuting video
+  // Handle user muting/unmuting video (Updated to include participantId)
   socket.on("toggle-video", ({ roomId, peerId, enabled }) => {
     console.log(`Video toggle: ${socket.id} - ${enabled}`);
 
@@ -563,6 +707,12 @@ io.on("connection", (socket) => {
     rooms[roomId].participants[socket.id].isHost = false;
     rooms[roomId].participants[newHostId].isHost = true;
 
+    // Notify old host they are no longer host
+    socket.emit("host-assigned", { isHost: false });
+
+    // Notify new host of their status
+    io.to(newHostId).emit("host-assigned", { isHost: true });
+
     // Send system message
     const systemMessage = {
       id: uuidv4(),
@@ -635,6 +785,8 @@ io.on("connection", (socket) => {
             newHost.isHost = true;
 
             // Notify new host
+            io.to(newHost.id).emit("host-assigned", { isHost: true });
+
             const hostMessage = {
               id: uuidv4(),
               message: `${newHost.username} is now the host`,
