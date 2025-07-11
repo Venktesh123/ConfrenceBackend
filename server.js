@@ -32,6 +32,10 @@ app.post("/api/room", (req, res) => {
       allowPrivateMessages: true,
       moderateMessages: false,
     },
+    hostMasterControls: {
+      controlAllAudio: true, // When host toggles audio, it affects all participants
+      controlAllVideo: true, // When host toggles video, it affects all participants
+    },
     createdAt: new Date(),
   };
   console.log(`Created room: ${roomId}`);
@@ -63,6 +67,7 @@ app.get("/api/room/:roomId", (req, res) => {
     messageCount: room.messages.length,
     hostId: room.hostId,
     chatSettings: room.chatSettings,
+    hostMasterControls: room.hostMasterControls,
   });
 });
 
@@ -105,7 +110,7 @@ io.on("connection", (socket) => {
       audioEnabled: true,
       videoEnabled: true,
       isHost: isFirstParticipant,
-      isScreenSharing: false, // Add screen sharing state
+      isScreenSharing: false,
     };
 
     console.log(
@@ -122,12 +127,12 @@ io.on("connection", (socket) => {
       roomCreatedAt: rooms[roomId].createdAt,
       isFirstParticipant,
       hostId: rooms[roomId].hostId,
+      hostMasterControls: rooms[roomId].hostMasterControls,
     });
 
     // Send recent chat messages to the new user
-    const recentMessages = rooms[roomId].messages.slice(-50); // Send last 50 messages
+    const recentMessages = rooms[roomId].messages.slice(-50);
     recentMessages.forEach((message) => {
-      // Filter messages based on user permissions
       if (shouldReceiveMessage(message, participantId, rooms[roomId])) {
         if (message.chatMode === "private") {
           socket.emit("private-message", message);
@@ -144,7 +149,13 @@ io.on("connection", (socket) => {
     // Send chat settings to the new user
     socket.emit("chat-settings-updated", rooms[roomId].chatSettings);
 
-    // Notify existing participants about the new user (include host status)
+    // Send host master controls settings
+    socket.emit(
+      "host-master-controls-updated",
+      rooms[roomId].hostMasterControls
+    );
+
+    // Notify existing participants about the new user
     socket.to(roomId).emit("user-joined", {
       participantId,
       username,
@@ -173,28 +184,24 @@ io.on("connection", (socket) => {
 
   // Helper function to determine if user should receive a message
   function shouldReceiveMessage(message, participantId, room) {
-    // System messages are visible to all
     if (message.type === "system") return true;
 
     const participant = room.participants[participantId];
     const isHost = participant && participant.id === room.hostId;
 
-    // Public messages
     if (message.chatMode === "public") {
       return room.chatSettings.allowParticipantChat || isHost;
     }
 
-    // Private messages
     if (message.chatMode === "private") {
       return (
-        message.senderId === participantId || // Sender
-        message.recipientId === participantId || // Direct recipient
-        (message.toHost && isHost) || // Message to host
-        isHost // Host can see all private messages
+        message.senderId === participantId ||
+        message.recipientId === participantId ||
+        (message.toHost && isHost) ||
+        isHost
       );
     }
 
-    // Host-only messages
     if (message.chatMode === "host-only") {
       return isHost;
     }
@@ -202,7 +209,183 @@ io.on("connection", (socket) => {
     return false;
   }
 
-  // NEW: Host control for audio
+  // NEW: Handle host master controls settings
+  socket.on("update-host-master-controls", ({ roomId, settings }) => {
+    if (!rooms[roomId]) {
+      return;
+    }
+
+    const participant = rooms[roomId].participants[socket.id];
+    const isHost = participant && participant.id === rooms[roomId].hostId;
+
+    // Only host can update master controls
+    if (!isHost) {
+      socket.emit("chat-error", {
+        message: "Only host can update master controls",
+      });
+      return;
+    }
+
+    // Update room master controls settings
+    rooms[roomId].hostMasterControls = {
+      ...rooms[roomId].hostMasterControls,
+      ...settings,
+    };
+
+    console.log(
+      `Host master controls updated in room ${roomId}:`,
+      rooms[roomId].hostMasterControls
+    );
+
+    // Broadcast updated settings to all participants
+    io.to(roomId).emit(
+      "host-master-controls-updated",
+      rooms[roomId].hostMasterControls
+    );
+
+    // Send system message
+    io.to(roomId).emit("chat-system-message", {
+      id: uuidv4(),
+      message: `Host ${
+        settings.controlAllAudio ? "enabled" : "disabled"
+      } master audio control and ${
+        settings.controlAllVideo ? "enabled" : "disabled"
+      } master video control`,
+      timestamp: new Date(),
+      type: "system",
+      systemType: "host-action",
+    });
+  });
+
+  // UPDATED: Handle user muting/unmuting audio with host master control
+  socket.on("toggle-audio", ({ roomId, peerId, enabled }) => {
+    console.log(`Audio toggle: ${socket.id} - ${enabled}`);
+
+    if (!rooms[roomId] || !rooms[roomId].participants[socket.id]) {
+      return;
+    }
+
+    const participant = rooms[roomId].participants[socket.id];
+    const isHost = participant && participant.id === rooms[roomId].hostId;
+    const hostMasterControls = rooms[roomId].hostMasterControls;
+
+    // Update the participant's own state
+    rooms[roomId].participants[socket.id].audioEnabled = enabled;
+
+    // If this is the host and master audio control is enabled
+    if (isHost && hostMasterControls.controlAllAudio) {
+      console.log(`Host is toggling audio for all participants: ${enabled}`);
+
+      // Apply to all other participants
+      Object.entries(rooms[roomId].participants).forEach(
+        ([participantId, p]) => {
+          if (participantId !== socket.id) {
+            // Don't affect the host themselves
+            // Update state
+            rooms[roomId].participants[participantId].audioEnabled = enabled;
+
+            // Send force control to each participant
+            io.to(participantId).emit("host-master-audio-control", {
+              enabled,
+              forced: true,
+              hostUsername: participant.username,
+            });
+          }
+        }
+      );
+
+      // Notify all participants about the global change
+      io.to(roomId).emit("user-toggle-audio", {
+        participantId: socket.id,
+        peerId,
+        enabled,
+        isHostMasterControl: true,
+      });
+
+      // Send system message
+      io.to(roomId).emit("chat-system-message", {
+        id: uuidv4(),
+        message: `Host ${enabled ? "unmuted" : "muted"} everyone's microphone`,
+        timestamp: new Date(),
+        type: "system",
+        systemType: "host-action",
+      });
+    } else {
+      // Normal participant audio toggle or host with master control disabled
+      socket.to(roomId).emit("user-toggle-audio", {
+        participantId: socket.id,
+        peerId,
+        enabled,
+        isHostMasterControl: false,
+      });
+    }
+  });
+
+  // UPDATED: Handle user muting/unmuting video with host master control
+  socket.on("toggle-video", ({ roomId, peerId, enabled }) => {
+    console.log(`Video toggle: ${socket.id} - ${enabled}`);
+
+    if (!rooms[roomId] || !rooms[roomId].participants[socket.id]) {
+      return;
+    }
+
+    const participant = rooms[roomId].participants[socket.id];
+    const isHost = participant && participant.id === rooms[roomId].hostId;
+    const hostMasterControls = rooms[roomId].hostMasterControls;
+
+    // Update the participant's own state
+    rooms[roomId].participants[socket.id].videoEnabled = enabled;
+
+    // If this is the host and master video control is enabled
+    if (isHost && hostMasterControls.controlAllVideo) {
+      console.log(`Host is toggling video for all participants: ${enabled}`);
+
+      // Apply to all other participants
+      Object.entries(rooms[roomId].participants).forEach(
+        ([participantId, p]) => {
+          if (participantId !== socket.id) {
+            // Don't affect the host themselves
+            // Update state
+            rooms[roomId].participants[participantId].videoEnabled = enabled;
+
+            // Send force control to each participant
+            io.to(participantId).emit("host-master-video-control", {
+              enabled,
+              forced: true,
+              hostUsername: participant.username,
+            });
+          }
+        }
+      );
+
+      // Notify all participants about the global change
+      io.to(roomId).emit("user-toggle-video", {
+        participantId: socket.id,
+        peerId,
+        enabled,
+        isHostMasterControl: true,
+      });
+
+      // Send system message
+      io.to(roomId).emit("chat-system-message", {
+        id: uuidv4(),
+        message: `Host ${enabled ? "enabled" : "disabled"} everyone's camera`,
+        timestamp: new Date(),
+        type: "system",
+        systemType: "host-action",
+      });
+    } else {
+      // Normal participant video toggle or host with master control disabled
+      socket.to(roomId).emit("user-toggle-video", {
+        participantId: socket.id,
+        peerId,
+        enabled,
+        isHostMasterControl: false,
+      });
+    }
+  });
+
+  // Individual host control for audio (existing functionality)
   socket.on(
     "host-control-audio",
     ({ roomId, targetPeerId, action, forced }) => {
@@ -211,7 +394,6 @@ io.on("connection", (socket) => {
 
       const hostParticipant = room.participants[socket.id];
 
-      // Verify sender is host
       if (!hostParticipant || !hostParticipant.isHost) {
         socket.emit("chat-error", {
           message: "Only hosts can control other participants",
@@ -219,7 +401,6 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Find target participant by peerId
       let targetSocketId = null;
       for (const [socketId, participant] of Object.entries(room.participants)) {
         if (participant.peerId === targetPeerId) {
@@ -233,21 +414,17 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Update participant state
       if (action === "mute") {
         room.participants[targetSocketId].audioEnabled = false;
 
-        // Send force mute to target participant
         io.to(targetSocketId).emit("host-muted-audio", { forced });
 
-        // Notify all participants about the change
         io.to(roomId).emit("user-toggle-audio", {
           participantId: targetSocketId,
           peerId: targetPeerId,
           enabled: false,
         });
 
-        // Send system message to chat
         io.to(roomId).emit("chat-system-message", {
           id: uuidv4(),
           message: `${room.participants[targetSocketId].username} was muted by host`,
@@ -256,10 +433,8 @@ io.on("connection", (socket) => {
           systemType: "host-action",
         });
       } else if (action === "unmute") {
-        // For unmute, just request - don't force
         io.to(targetSocketId).emit("host-unmuted-audio");
 
-        // Send system message to chat
         io.to(roomId).emit("chat-system-message", {
           id: uuidv4(),
           message: `Host requested ${room.participants[targetSocketId].username} to unmute`,
@@ -271,7 +446,7 @@ io.on("connection", (socket) => {
     }
   );
 
-  // NEW: Host control for video
+  // Individual host control for video (existing functionality)
   socket.on(
     "host-control-video",
     ({ roomId, targetPeerId, action, forced }) => {
@@ -280,7 +455,6 @@ io.on("connection", (socket) => {
 
       const hostParticipant = room.participants[socket.id];
 
-      // Verify sender is host
       if (!hostParticipant || !hostParticipant.isHost) {
         socket.emit("chat-error", {
           message: "Only hosts can control other participants",
@@ -288,7 +462,6 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Find target participant by peerId
       let targetSocketId = null;
       for (const [socketId, participant] of Object.entries(room.participants)) {
         if (participant.peerId === targetPeerId) {
@@ -302,21 +475,17 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Update participant state
       if (action === "disable") {
         room.participants[targetSocketId].videoEnabled = false;
 
-        // Send force disable to target participant
         io.to(targetSocketId).emit("host-disabled-video", { forced });
 
-        // Notify all participants about the change
         io.to(roomId).emit("user-toggle-video", {
           participantId: targetSocketId,
           peerId: targetPeerId,
           enabled: false,
         });
 
-        // Send system message to chat
         io.to(roomId).emit("chat-system-message", {
           id: uuidv4(),
           message: `${room.participants[targetSocketId].username}'s camera was turned off by host`,
@@ -325,10 +494,8 @@ io.on("connection", (socket) => {
           systemType: "host-action",
         });
       } else if (action === "enable") {
-        // For enable, just request - don't force
         io.to(targetSocketId).emit("host-enabled-video");
 
-        // Send system message to chat
         io.to(roomId).emit("chat-system-message", {
           id: uuidv4(),
           message: `Host requested ${room.participants[targetSocketId].username} to turn on camera`,
@@ -356,7 +523,6 @@ io.on("connection", (socket) => {
       const participant = rooms[roomId].participants[socket.id];
       const isHost = participant && participant.id === rooms[roomId].hostId;
 
-      // Check permissions
       if (!isHost && !rooms[roomId].chatSettings.allowParticipantChat) {
         socket.emit("chat-error", { message: "Public chat is disabled" });
         return;
@@ -372,15 +538,12 @@ io.on("connection", (socket) => {
         senderId: socket.id,
       };
 
-      // Store message in room
       rooms[roomId].messages.push(messageData);
 
-      // Keep only last 100 messages to prevent memory issues
       if (rooms[roomId].messages.length > 100) {
         rooms[roomId].messages = rooms[roomId].messages.slice(-100);
       }
 
-      // Broadcast message to all participants in the room
       io.to(roomId).emit("chat-message", messageData);
     }
   );
@@ -402,7 +565,6 @@ io.on("connection", (socket) => {
       const participant = rooms[roomId].participants[socket.id];
       const isHost = participant && participant.id === rooms[roomId].hostId;
 
-      // Check permissions
       if (!isHost && !rooms[roomId].chatSettings.allowPrivateMessages) {
         socket.emit("chat-error", { message: "Private messages are disabled" });
         return;
@@ -410,11 +572,9 @@ io.on("connection", (socket) => {
 
       let recipientId = null;
 
-      // Find recipient
       if (toHost) {
         recipientId = rooms[roomId].hostId;
       } else if (recipient) {
-        // Find participant by username
         const recipientParticipant = Object.values(
           rooms[roomId].participants
         ).find((p) => p.username === recipient);
@@ -439,23 +599,18 @@ io.on("connection", (socket) => {
         toHost,
       };
 
-      // Store message in room
       rooms[roomId].messages.push(messageData);
 
-      // Keep only last 100 messages
       if (rooms[roomId].messages.length > 100) {
         rooms[roomId].messages = rooms[roomId].messages.slice(-100);
       }
 
-      // Send to sender
       socket.emit("private-message", messageData);
 
-      // Send to recipient
       if (recipientId !== socket.id) {
         io.to(recipientId).emit("private-message", messageData);
       }
 
-      // If message is to host and sender is not host, also send to host
       if (toHost && !isHost) {
         io.to(rooms[roomId].hostId).emit("private-message", messageData);
       }
@@ -473,7 +628,6 @@ io.on("connection", (socket) => {
     const participant = rooms[roomId].participants[socket.id];
     const isHost = participant && participant.id === rooms[roomId].hostId;
 
-    // Only host can send host-only messages
     if (!isHost) {
       socket.emit("chat-error", {
         message: "Only host can send announcements",
@@ -491,19 +645,16 @@ io.on("connection", (socket) => {
       senderId: socket.id,
     };
 
-    // Store message in room
     rooms[roomId].messages.push(messageData);
 
-    // Keep only last 100 messages
     if (rooms[roomId].messages.length > 100) {
       rooms[roomId].messages = rooms[roomId].messages.slice(-100);
     }
 
-    // Send only to host (for now, could be extended to all participants)
     socket.emit("host-message", messageData);
   });
 
-  // Handle system messages (user joined/left)
+  // Handle system messages
   socket.on("send-system-message", ({ roomId, message, type }) => {
     console.log(`System message in room ${roomId}: ${message}`);
 
@@ -516,22 +667,19 @@ io.on("connection", (socket) => {
       message,
       timestamp: new Date(),
       type: "system",
-      systemType: type, // 'join' or 'leave'
+      systemType: type,
     };
 
-    // Store system message in room
     rooms[roomId].messages.push(messageData);
 
-    // Keep only last 100 messages
     if (rooms[roomId].messages.length > 100) {
       rooms[roomId].messages = rooms[roomId].messages.slice(-100);
     }
 
-    // Broadcast system message to all participants
     io.to(roomId).emit("chat-system-message", messageData);
   });
 
-  // Handle chat settings updates (host only)
+  // Handle chat settings updates
   socket.on("update-chat-settings", ({ roomId, settings }) => {
     if (!rooms[roomId]) {
       return;
@@ -540,7 +688,6 @@ io.on("connection", (socket) => {
     const participant = rooms[roomId].participants[socket.id];
     const isHost = participant && participant.id === rooms[roomId].hostId;
 
-    // Only host can update chat settings
     if (!isHost) {
       socket.emit("chat-error", {
         message: "Only host can update chat settings",
@@ -548,7 +695,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Update room chat settings
     rooms[roomId].chatSettings = { ...rooms[roomId].chatSettings, ...settings };
 
     console.log(
@@ -556,7 +702,6 @@ io.on("connection", (socket) => {
       rooms[roomId].chatSettings
     );
 
-    // Broadcast updated settings to all participants
     io.to(roomId).emit("chat-settings-updated", rooms[roomId].chatSettings);
   });
 
@@ -566,43 +711,10 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Broadcast typing indicator to other participants
     socket.to(roomId).emit("user-typing", {
       username,
       isTyping,
     });
-  });
-
-  // Handle user muting/unmuting audio (Updated to include participantId)
-  socket.on("toggle-audio", ({ roomId, peerId, enabled }) => {
-    console.log(`Audio toggle: ${socket.id} - ${enabled}`);
-
-    if (rooms[roomId] && rooms[roomId].participants[socket.id]) {
-      rooms[roomId].participants[socket.id].audioEnabled = enabled;
-
-      // Notify other participants
-      socket.to(roomId).emit("user-toggle-audio", {
-        participantId: socket.id,
-        peerId,
-        enabled,
-      });
-    }
-  });
-
-  // Handle user muting/unmuting video (Updated to include participantId)
-  socket.on("toggle-video", ({ roomId, peerId, enabled }) => {
-    console.log(`Video toggle: ${socket.id} - ${enabled}`);
-
-    if (rooms[roomId] && rooms[roomId].participants[socket.id]) {
-      rooms[roomId].participants[socket.id].videoEnabled = enabled;
-
-      // Notify other participants
-      socket.to(roomId).emit("user-toggle-video", {
-        participantId: socket.id,
-        peerId,
-        enabled,
-      });
-    }
   });
 
   // Handle screen sharing events
@@ -612,7 +724,6 @@ io.on("connection", (socket) => {
     if (rooms[roomId] && rooms[roomId].participants[socket.id]) {
       rooms[roomId].participants[socket.id].isScreenSharing = isSharing;
 
-      // Notify other participants about screen sharing status
       socket.to(roomId).emit("user-screen-share", {
         participantId: socket.id,
         peerId,
@@ -627,7 +738,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Handle removing a participant (by admin)
+  // Handle removing a participant
   socket.on("remove-participant", ({ roomId, participantId, peerId }) => {
     console.log(`Removing participant: ${participantId}`);
 
@@ -638,7 +749,6 @@ io.on("connection", (socket) => {
     const requester = rooms[roomId].participants[socket.id];
     const isHost = requester && requester.id === rooms[roomId].hostId;
 
-    // Only host can remove participants
     if (!isHost) {
       socket.emit("chat-error", {
         message: "Only host can remove participants",
@@ -649,7 +759,6 @@ io.on("connection", (socket) => {
     if (rooms[roomId].participants[participantId]) {
       const removedParticipant = rooms[roomId].participants[participantId];
 
-      // Send system message about user removal
       const systemMessage = {
         id: uuidv4(),
         message: `${removedParticipant.username} was removed from the meeting`,
@@ -661,19 +770,15 @@ io.on("connection", (socket) => {
       rooms[roomId].messages.push(systemMessage);
       io.to(roomId).emit("chat-system-message", systemMessage);
 
-      // Notify the participant they're being removed
       io.to(participantId).emit("you-were-removed");
 
-      // Notify other participants
       socket.to(roomId).emit("user-removed", {
         participantId,
         peerId,
       });
 
-      // Remove from room data
       delete rooms[roomId].participants[participantId];
 
-      // Force disconnect the removed user
       io.sockets.sockets.get(participantId)?.disconnect(true);
     }
   });
@@ -688,7 +793,6 @@ io.on("connection", (socket) => {
     const isCurrentHost =
       currentHost && currentHost.id === rooms[roomId].hostId;
 
-    // Only current host can transfer privileges
     if (!isCurrentHost) {
       socket.emit("chat-error", {
         message: "Only host can transfer privileges",
@@ -702,18 +806,13 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // Update host status
     rooms[roomId].hostId = newHostId;
     rooms[roomId].participants[socket.id].isHost = false;
     rooms[roomId].participants[newHostId].isHost = true;
 
-    // Notify old host they are no longer host
     socket.emit("host-assigned", { isHost: false });
-
-    // Notify new host of their status
     io.to(newHostId).emit("host-assigned", { isHost: true });
 
-    // Send system message
     const systemMessage = {
       id: uuidv4(),
       message: `${newHost.username} is now the host`,
@@ -725,7 +824,6 @@ io.on("connection", (socket) => {
     rooms[roomId].messages.push(systemMessage);
     io.to(roomId).emit("chat-system-message", systemMessage);
 
-    // Notify all participants of host change
     io.to(roomId).emit("host-privileges-updated", {
       newHostId,
       newHostUsername: newHost.username,
@@ -740,7 +838,6 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log(`User disconnected: ${socket.id}`);
 
-    // Find which room this user was in
     for (const roomId in rooms) {
       if (rooms[roomId].participants[socket.id]) {
         const participant = rooms[roomId].participants[socket.id];
@@ -752,7 +849,6 @@ io.on("connection", (socket) => {
           }`
         );
 
-        // Send system message about user leaving
         const systemMessage = {
           id: uuidv4(),
           message: `${participant.username} left the meeting`,
@@ -764,17 +860,14 @@ io.on("connection", (socket) => {
         rooms[roomId].messages.push(systemMessage);
         socket.to(roomId).emit("chat-system-message", systemMessage);
 
-        // Notify other participants
         socket.to(roomId).emit("user-left", {
           participantId: socket.id,
           peerId: participant.peerId,
           username: participant.username,
         });
 
-        // Remove from room data
         delete rooms[roomId].participants[socket.id];
 
-        // If host left, transfer to next participant
         if (wasHost) {
           const remainingParticipants = Object.values(
             rooms[roomId].participants
@@ -784,7 +877,6 @@ io.on("connection", (socket) => {
             rooms[roomId].hostId = newHost.id;
             newHost.isHost = true;
 
-            // Notify new host
             io.to(newHost.id).emit("host-assigned", { isHost: true });
 
             const hostMessage = {
@@ -812,7 +904,6 @@ io.on("connection", (socket) => {
           } participants`
         );
 
-        // If room is empty, remove it after a delay
         if (Object.keys(rooms[roomId].participants).length === 0) {
           setTimeout(() => {
             if (
@@ -822,7 +913,7 @@ io.on("connection", (socket) => {
               delete rooms[roomId];
               console.log(`Room ${roomId} has been removed due to inactivity`);
             }
-          }, 60000); // Remove after 1 minute of inactivity
+          }, 60000);
         }
 
         break;
@@ -845,6 +936,7 @@ app.get("/api/debug/rooms", (req, res) => {
       messageCount: rooms[roomId].messages.length,
       hostId: rooms[roomId].hostId,
       chatSettings: rooms[roomId].chatSettings,
+      hostMasterControls: rooms[roomId].hostMasterControls,
       participants: Object.values(rooms[roomId].participants).map((p) => ({
         username: p.username,
         peerId: p.peerId,
@@ -877,6 +969,7 @@ app.get("/api/room/:roomId/messages", (req, res) => {
     roomId: room.id,
     messages: room.messages,
     chatSettings: room.chatSettings,
+    hostMasterControls: room.hostMasterControls,
   });
 });
 
@@ -892,6 +985,7 @@ app.get("/api/room/:roomId/chat-settings", (req, res) => {
   res.json({
     roomId: room.id,
     chatSettings: room.chatSettings,
+    hostMasterControls: room.hostMasterControls,
   });
 });
 
